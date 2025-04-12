@@ -1,0 +1,9 @@
+transformers>=4.30.0
+torch>=2.0.0
+cryptography>=40.0.0
+python-dotenv>=1.0.0
+# For did:key generation helper
+base58>=2.1.0
+
+# Add testing libraries later if needed
+# pytest>=7.0.0 

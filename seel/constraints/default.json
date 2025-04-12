@@ -1,0 +1,4 @@
+{
+  "prohibited_keywords": ["confidential", "secret", "private"],
+  "max_length": 512
+} 
