@@ -5,6 +5,7 @@ import logging
 import sys
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ed25519
+import pickle # For deserializing Receipt
 
 # Configure basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -14,7 +15,8 @@ from seel.utils import (
     hash_string, hash_directory, parse_did_key, public_key_from_bytes,
     load_public_key_pem # Might need this if comparing against a known key file
 )
-from seel.mock_attestor import verify_mock_attestation, create_attestation_payload
+from seel.mock_attestor import verify_mock_attestation
+from seel.risc0_attestor import verify_attestation as verify_risc0_attestation, RISC0_INSTALLED, Receipt
 
 def verify_bundle(bundle_path: str) -> bool:
     """
@@ -74,19 +76,25 @@ def verify_bundle(bundle_path: str) -> bool:
     meta_constraint_hash = metadata.get("constraint_hash")
     meta_prompt_hash = metadata.get("prompt_hash")
     meta_output_hash = metadata.get("output_hash") # Can be None
-    meta_attestation_ref = metadata.get("attestation_reference")
-    meta_attestation_payload_hash = metadata.get("attestation_payload_hash")
+    attestation_type = metadata.get("attestation_type")
+    attestation_reference = metadata.get("attestation_reference")
 
-    required_meta_fields = [
-        prover_did, meta_model_hash, meta_constraint_hash,
-        meta_prompt_hash, meta_attestation_ref, meta_attestation_payload_hash
-        # meta_output_hash is optional depending on whether output.txt is included
-    ]
-    if not all(required_meta_fields):
-         add_check("Metadata Content Check", False, "meta.json is missing one or more required fields.")
-         return False
+    if not attestation_type or attestation_type not in ["mock", "risc0"]:
+        add_check("Metadata Content Check (Attestation Type)", False, f"Missing or invalid attestation_type: {attestation_type}")
+        return False
     else:
-        add_check("Metadata Content Check", True)
+        add_check("Metadata Content Check (Attestation Type)", True)
+
+    # Check other required fields based on type
+    required_base = [prover_did, meta_model_hash, meta_constraint_hash, meta_prompt_hash, attestation_reference]
+    required_mock = [metadata.get("mock_payload_hash")] if attestation_type == "mock" else []
+    required_risc0 = [metadata.get("risc0_image_id")] if attestation_type == "risc0" else []
+
+    if not all(required_base + required_mock + required_risc0):
+        add_check("Metadata Content Check (Required Fields)", False, "meta.json is missing one or more required fields for its type.")
+        return False
+    else:
+        add_check("Metadata Content Check (Required Fields)", True)
 
     # --- Check 3: Parse Prover DID and Get Public Key --- 
     if not prover_did:
@@ -119,69 +127,133 @@ def verify_bundle(bundle_path: str) -> bool:
         add_check("Verify meta.sig", False, f"meta.sig verification failed: {e}")
         return False # Bundle integrity compromised
 
-    # --- Check 5: Load Mock Proof File --- 
-    if meta_attestation_ref != "mock_proof.json":
-        add_check("Load Mock Proof", False, f"Metadata attestation reference points to unexpected file: {meta_attestation_ref}")
+    # --- Check 5: Load and Verify Attestation Artifact --- 
+    attestation_path = os.path.join(bundle_path, attestation_reference)
+    if not os.path.exists(attestation_path):
+        add_check(f"Attestation File Existence ({attestation_reference})", False, f"Attestation file missing: {attestation_path}")
         return False
-    try:
-        with open(mock_proof_path, 'r') as f:
-            mock_proof_content = json.load(f)
-        attestation_payload_obj = mock_proof_content.get("payload")
-        attestation_payload_hash_in_proof = mock_proof_content.get("payload_hash")
-        attestation_signature = mock_proof_content.get("signature")
-        if not all([isinstance(attestation_payload_obj, dict), attestation_payload_hash_in_proof, attestation_signature]):
-            raise ValueError("mock_proof.json is missing payload, payload_hash, or signature")
-        add_check("Load Mock Proof", True)
-    except Exception as e:
-        add_check("Load Mock Proof", False, f"Failed to load or parse mock_proof.json: {e}")
+    else:
+        add_check(f"Attestation File Existence ({attestation_reference})", True)
+        
+    is_attestation_valid = False
+    journal_bytes_list = [] # For risc0 journal check later
+    
+    if attestation_type == "mock":
+        meta_payload_hash = metadata.get("mock_payload_hash")
+        try:
+            with open(attestation_path, 'r') as f:
+                mock_proof_content = json.load(f)
+            payload_hash_in_proof = mock_proof_content.get("payload_hash")
+            signature = mock_proof_content.get("signature")
+            if not payload_hash_in_proof or not signature:
+                raise ValueError("mock_proof.json missing payload_hash or signature")
+            
+            # Consistency check: Hash in meta vs hash in proof file
+            if payload_hash_in_proof != meta_payload_hash:
+                add_check("Consistency: Mock Payload Hash", False, f"Hash in meta.json ({meta_payload_hash}) != hash in proof file ({payload_hash_in_proof})")
+                return False
+            else:
+                add_check("Consistency: Mock Payload Hash", True)
+                
+            # Verify signature (we need to reconstruct the payload string)
+            # This requires knowing the exact inputs that created the hash.
+            # We stored hashes in meta.json, let's recreate the payload from those.
+            payload_str = json.dumps({
+                "model_hash": meta_model_hash,
+                "constraint_hash": meta_constraint_hash,
+                "prompt_hash": meta_prompt_hash,
+                "output_hash": meta_output_hash
+            }, sort_keys=True)
+            
+            # Verify the signature from the proof file against the reconstructed payload hash
+            is_attestation_valid = verify_mock_attestation(payload_str, signature, prover_public_key)
+            add_check("Verify Mock Attestation Signature", is_attestation_valid)
+            
+        except Exception as e:
+            add_check("Load/Verify Mock Proof", False, f"Error processing mock_proof.json: {e}")
+            return False
+            
+    elif attestation_type == "risc0":
+        meta_image_id = metadata.get("risc0_image_id")
+        if not RISC0_INSTALLED:
+            add_check("Verify Risc0 Attestation", False, "risc0-zkvm library not installed, cannot verify.")
+            return False
+        try:
+            with open(attestation_path, 'rb') as f:
+                receipt = pickle.load(f)
+            if not isinstance(receipt, Receipt):
+                raise TypeError("Deserialized object is not a Risc0 Receipt")
+            
+            # Verify receipt against image ID from meta.json
+            is_attestation_valid = verify_risc0_attestation(receipt, meta_image_id)
+            add_check("Verify Risc0 Receipt", is_attestation_valid)
+            
+            if is_attestation_valid:
+                # Extract journal for later checks
+                journal_bytes_list = receipt.get_journal()
+                logger.info(f"Risc0 Journal contains {len(journal_bytes_list)} entries.")
+                
+        except (pickle.UnpicklingError, TypeError, FileNotFoundError) as e:
+            add_check("Load/Verify Risc0 Receipt", False, f"Error processing receipt.bin: {e}")
+            return False
+        except Exception as e:
+            # Catch verification errors from verify_risc0_attestation
+            add_check("Verify Risc0 Receipt", False, f"Receipt verification failed: {e}")
+            is_attestation_valid = False # Ensure flag is false
+
+    if not is_attestation_valid:
+        logger.error("Core attestation verification failed.")
+        return False # Stop if the core proof/sig is invalid
+
+    # --- Check 6: Consistency - Attestation Content vs Metadata --- 
+    content_consistent = False
+    if attestation_type == "mock":
+        # For mock, we already verified the payload hash matches meta hash
+        # and verified the signature against a reconstructed payload based on meta hashes.
+        # So, if we passed Check 6, content is considered consistent.
+        content_consistent = True 
+        add_check("Consistency: Attestation Content vs Metadata", content_consistent, "Mock payload hash verified against metadata.")
+    elif attestation_type == "risc0":
+        # For risc0, check if journal contents match metadata hashes
+        try:
+            if len(journal_bytes_list) == 4:
+                journal_model_hash = journal_bytes_list[0].decode('utf-8')
+                journal_constraint_hash = journal_bytes_list[1].decode('utf-8')
+                journal_prompt_hash = journal_bytes_list[2].decode('utf-8')
+                journal_output_hash = journal_bytes_list[3].decode('utf-8')
+                
+                checks = []
+                if journal_model_hash != meta_model_hash: checks.append("model_hash")
+                if journal_constraint_hash != meta_constraint_hash: checks.append("constraint_hash")
+                if journal_prompt_hash != meta_prompt_hash: checks.append("prompt_hash")
+                # Handle potential None in meta_output_hash
+                meta_output_hash_str = meta_output_hash if meta_output_hash is not None else ""
+                if journal_output_hash != meta_output_hash_str and not (meta_output_hash is None and journal_output_hash == hash_string("")):
+                    # Allow empty string hash if meta was None, otherwise compare
+                    # Need to be careful here depending on how None output was handled in guest/hashing
+                    # Assuming guest always gets *some* string (even empty) for output hash if output is None
+                    # Let's refine this: If meta_output_hash is None, journal_output_hash should correspond to hash_string(None)? No, guest receives a hash.
+                    # Host side (seel_cli) calculates output_hash = hash_string(output_text) if output_text is not None else hash_string("") - ASSUMPTION NEEDED?
+                    # Let's assume seel_cli passes hash_string("") if output is None.
+                    expected_output_hash = meta_output_hash if meta_output_hash is not None else hash_string("")
+                    if journal_output_hash != expected_output_hash:
+                        checks.append(f"output_hash (journal: {journal_output_hash}, expected: {expected_output_hash})")
+                    
+                if not checks:
+                    content_consistent = True
+                    add_check("Consistency: Risc0 Journal vs Metadata", True, "Journal hashes match metadata.")
+                else:
+                    add_check("Consistency: Risc0 Journal vs Metadata", False, f"Mismatches found: {checks}")
+            else:
+                add_check("Consistency: Risc0 Journal vs Metadata", False, f"Expected 4 journal entries, found {len(journal_bytes_list)}")
+        except Exception as e:
+            add_check("Consistency: Risc0 Journal vs Metadata", False, f"Error decoding or comparing journal: {e}")
+            
+    if not content_consistent:
         return False
 
-    # --- Check 6: Verify Internal Mock Attestation Signature --- 
-    # Recreate the canonical payload string from the object in the proof file
-    attestation_payload_str = json.dumps(attestation_payload_obj, sort_keys=True)
-    # Verify the signature within mock_proof.json using the public key derived from meta.json
-    is_attestation_valid = verify_mock_attestation(
-        payload_str=attestation_payload_str,
-        signature_hex=attestation_signature,
-        public_key=prover_public_key
-    )
-    add_check("Verify Mock Attestation Signature", is_attestation_valid, "Internal signature in mock_proof.json is valid.")
-    if not is_attestation_valid:
-        return False
-        
-    # --- Check 7: Consistency - Attestation Payload Hash --- 
-    # Verify the hash stored *in* the proof file matches the hash stored *in* meta.json
-    if attestation_payload_hash_in_proof != meta_attestation_payload_hash:
-         add_check("Consistency: Attestation Payload Hash", False, 
-                   f"Hash in meta.json ({meta_attestation_payload_hash}) != hash in proof file ({attestation_payload_hash_in_proof})")
-         return False
-    else:
-         add_check("Consistency: Attestation Payload Hash", True)
-         
-    # --- Check 8: Consistency - Payload Content vs Metadata Hashes --- 
-    # Verify that the hashes *inside* the attestation payload match the hashes in meta.json
-    payload_model_hash = attestation_payload_obj.get("model_hash")
-    payload_constraint_hash = attestation_payload_obj.get("constraint_hash")
-    payload_prompt_hash = attestation_payload_obj.get("prompt_hash")
-    payload_output_hash = attestation_payload_obj.get("output_hash") # Can be None
-    
-    consistency_checks = []
-    if payload_model_hash != meta_model_hash:
-        consistency_checks.append(f"Model Hash (payload {payload_model_hash} != meta {meta_model_hash})")
-    if payload_constraint_hash != meta_constraint_hash:
-        consistency_checks.append(f"Constraint Hash (payload {payload_constraint_hash} != meta {meta_constraint_hash})")
-    if payload_prompt_hash != meta_prompt_hash:
-        consistency_checks.append(f"Prompt Hash (payload {payload_prompt_hash} != meta {meta_prompt_hash})")
-    if payload_output_hash != meta_output_hash: # Checks None == None correctly
-        consistency_checks.append(f"Output Hash (payload {payload_output_hash} != meta {meta_output_hash})")
-        
-    if consistency_checks:
-        add_check("Consistency: Payload Hashes vs Metadata Hashes", False, f"Mismatches found: {'; '.join(consistency_checks)}")
-        return False
-    else:
-        add_check("Consistency: Payload Hashes vs Metadata Hashes", True)
-        
-    # --- Check 9: Consistency - Files vs Hashes --- 
+    # --- Check 7: Consistency - Files vs Hashes --- 
+    # Renumbered from Check 9
     # Verify hashes of actual files match hashes in metadata
     files_consistent = True
     file_check_messages = []

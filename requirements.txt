@@ -5,5 +5,14 @@ python-dotenv>=1.0.0
 # For did:key generation helper
 base58>=2.1.0
 
+# ZK Proving Frameworks
+# risc0-zkvm>=1.0, <2.0 # Managed by rzup
+
 # Add testing libraries later if needed
-# pytest>=7.0.0 
+# pytest>=7.0.0
+
+# ONNX, EZKL, and Optimum dependencies
+onnx>=1.15.0 # Or check ezkl docs for recommended version
+onnxruntime>=1.16.0 # Required backend for Optimum ONNX export/inference
+optimum>=1.16.0 # For robust HF -> ONNX export
+ezkl>=21.0.0 # Install latest compatible found previously 

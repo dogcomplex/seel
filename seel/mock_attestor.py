@@ -22,18 +22,29 @@ def create_attestation_payload(model_hash: str, constraint_hash: str, prompt_has
     # Use sort_keys=True for deterministic serialization
     return json.dumps(payload, sort_keys=True)
 
-def generate_mock_attestation(payload_str: str, private_key: ed25519.Ed25519PrivateKey) -> tuple[str, str]:
+def generate_mock_attestation(payload_str: str, private_key: ed25519.Ed25519PrivateKey) -> dict:
     """
     Hashes the payload string and signs the hash with the private key.
+    Returns a dictionary containing attestation details.
 
     Args:
         payload_str: The JSON string payload created by create_attestation_payload.
         private_key: The prover's Ed25519 private key object.
 
     Returns:
-        A tuple containing: (payload_hash: str, signature_hex: str)
-        Returns (None, None) if signing fails.
+        A dictionary: {
+            "type": "mock",
+            "image_id": None,
+            "payload_hash": hash_string | None, # None on failure
+            "proof_data": signature_hex | None  # None on failure
+        }
     """
+    result = {
+        "type": "mock",
+        "image_id": None,
+        "payload_hash": None,
+        "proof_data": None
+    }
     try:
         # Hash the payload string (using SHA256 consistent with other hashes)
         payload_hash = hash_string(payload_str, 'sha256')
@@ -45,11 +56,14 @@ def generate_mock_attestation(payload_str: str, private_key: ed25519.Ed25519Priv
 
         signature_hex = signature.hex()
         logger.info(f"Generated signature for payload hash (length: {len(signature_hex)})")
-        return payload_hash, signature_hex
+
+        result["payload_hash"] = payload_hash
+        result["proof_data"] = signature_hex
+        return result
 
     except Exception as e:
         logger.error(f"Failed to generate mock attestation: {e}", exc_info=True)
-        return None, None
+        return result # Return dict with None values on error
 
 def verify_mock_attestation(payload_str: str, signature_hex: str, public_key: ed25519.Ed25519PublicKey) -> bool:
     """
@@ -107,22 +121,28 @@ if __name__ == '__main__':
         print(f"Attestation Payload: {payload}")
 
         # Generate attestation
-        payload_hash, signature = generate_mock_attestation(payload, private_key)
-        print(f"Payload Hash: {payload_hash}")
-        print(f"Signature: {signature[:30]}...{signature[-30:]}")
+        attestation_result = generate_mock_attestation(payload, private_key)
+        payload_hash = attestation_result["payload_hash"]
+        signature = attestation_result["proof_data"]
+        
+        if payload_hash and signature:
+            print(f"Payload Hash: {payload_hash}")
+            print(f"Signature: {signature[:30]}...{signature[-30:]}")
 
-        # Verify attestation (using re-derived public key)
-        is_valid = verify_mock_attestation(payload, signature, public_key)
-        print(f"Verification Result (Correct Key): {is_valid}")
+            # Verify attestation (using re-derived public key)
+            is_valid = verify_mock_attestation(payload, signature, public_key)
+            print(f"Verification Result (Correct Key): {is_valid}")
 
-        # Test verification failure (tamper with payload)
-        tampered_payload = payload.replace("100", "200")
-        is_valid_tampered = verify_mock_attestation(tampered_payload, signature, public_key)
-        print(f"Verification Result (Tampered Payload): {is_valid_tampered}")
+            # Test verification failure (tamper with payload)
+            tampered_payload = payload.replace("100", "200")
+            is_valid_tampered = verify_mock_attestation(tampered_payload, signature, public_key)
+            print(f"Verification Result (Tampered Payload): {is_valid_tampered}")
 
-        # Test verification failure (wrong key)
-        wrong_private_key = ed25519.Ed25519PrivateKey.generate()
-        wrong_public_key = wrong_private_key.public_key()
-        is_valid_wrong_key = verify_mock_attestation(payload, signature, wrong_public_key)
-        print(f"Verification Result (Wrong Key): {is_valid_wrong_key}")
+            # Test verification failure (wrong key)
+            wrong_private_key = ed25519.Ed25519PrivateKey.generate()
+            wrong_public_key = wrong_private_key.public_key()
+            is_valid_wrong_key = verify_mock_attestation(payload, signature, wrong_public_key)
+            print(f"Verification Result (Wrong Key): {is_valid_wrong_key}")
+        else:
+            print("Mock attestation generation failed.")
         print("-----------------------------") 

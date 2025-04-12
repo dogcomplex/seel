@@ -1,0 +1,13 @@
+# Cargo.toml for the risc0 guest program
+
+[package]
+name = "risc0-guest"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Align version with other risc0 libs being compiled (e.g., risc0-zkp v1.2.6 seen in logs)
+risc0-zkvm = { version = "=1.2.6", default-features = false }
+# `std` feature is not needed for guest, `serde` feature is not used in simplified guest code
+
+[workspace] 

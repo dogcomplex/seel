@@ -9,11 +9,43 @@ dist/
 build/
 *.egg-info/
 
-# Output
-keys/
+# Python virtual environment
+.venv/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Output directories
 output_bundles/
+keys/
+
+# Risc0 Guest build artifacts
+risc0-guest/target/
+
+# EZKL / ONNX related files (if generated outside ignored dirs)
+*.key
+*.pf
+*.compiled
+*.srs
+*.onnx
+witness.json
+input.json
+
+# Temporary files from CLI export attempts
+temp_*.onnx
+temp_*.json
 
 # IDE / OS stuff
 .vscode/
 .idea/
-*.DS_Store 
+*.DS_Store
+
+# OS generated files
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db 

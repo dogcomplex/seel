@@ -6,6 +6,7 @@ import logging
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from seel.utils import hash_string, load_private_key_pem, generate_did_key
+import pickle # For serializing the Receipt object
 
 logger = logging.getLogger(__name__)
 
@@ -17,9 +18,7 @@ def create_bundle(output_dir_base: str,
                   constraint_hash: str,
                   prompt: str,
                   output_text: str | None,
-                  attestation_payload: str, # The JSON string payload
-                  attestation_payload_hash: str,
-                  attestation_signature: str,
+                  attestation_result: dict, # Now takes the result dict
                   private_key_path: str,
                   include_output_file: bool = True
                   ) -> str | None:
@@ -33,9 +32,7 @@ def create_bundle(output_dir_base: str,
         constraint_hash: Hash of the canonical constraint definition used.
         prompt: The original input prompt.
         output_text: The generated output text (or None if not saving).
-        attestation_payload: The JSON string payload that was signed for the mock attestation.
-        attestation_payload_hash: The hash of the attestation payload.
-        attestation_signature: The signature of the attestation payload hash.
+        attestation_result: The dictionary returned by the selected attestor.
         private_key_path: Path to the prover's private key PEM file for signing meta.json.
         include_output_file: Whether to save the output_text to output.txt.
 
@@ -59,45 +56,75 @@ def create_bundle(output_dir_base: str,
         prompt_hash = hash_string(prompt)
         output_hash = hash_string(output_text) if output_text is not None else None
 
-        # 4. Create Mock Proof File (containing payload and signature)
-        mock_proof_content = {
-            "payload": json.loads(attestation_payload), # Store payload as object
-            "payload_hash": attestation_payload_hash,
-            "signature": attestation_signature
-        }
-        mock_proof_path = os.path.join(bundle_path, "mock_proof.json")
-        with open(mock_proof_path, 'w') as f:
-            json.dump(mock_proof_content, f, indent=2)
-        logger.info(f"Created mock proof file: {mock_proof_path}")
+        # 4. Prepare Attestation Files based on type
+        attestation_type = attestation_result["type"]
+        attestation_reference = None
+        risc0_image_id = None # Only populated for risc0
+        mock_payload_hash = None # Only populated for mock
+
+        if attestation_type == "mock":
+            mock_payload_hash = attestation_result["payload_hash"]
+            signature = attestation_result["proof_data"]
+            # Recreate payload dict for saving (mock_attestor only returned hash/sig)
+            # This assumes create_mock_payload is accessible or we reconstruct based on known inputs
+            # For simplicity, we might just store hash and sig in mock_proof.json
+            mock_proof_content = {
+                # "payload": json.loads(attestation_payload), # Not passed anymore
+                "payload_hash": mock_payload_hash,
+                "signature": signature
+            }
+            attestation_reference = "mock_proof.json"
+            mock_proof_path = os.path.join(bundle_path, attestation_reference)
+            with open(mock_proof_path, 'w') as f:
+                json.dump(mock_proof_content, f, indent=2)
+            logger.info(f"Created mock proof file: {mock_proof_path}")
+
+        elif attestation_type == "risc0":
+            risc0_image_id = attestation_result["image_id"]
+            receipt = attestation_result["proof_data"]
+            attestation_reference = "receipt.bin" # Use binary extension for pickled object
+            receipt_path = os.path.join(bundle_path, attestation_reference)
+            # Serialize the Receipt object using pickle (or jsonpickle if preferred)
+            try:
+                with open(receipt_path, 'wb') as f:
+                    pickle.dump(receipt, f)
+                logger.info(f"Created Risc0 receipt file (serialized): {receipt_path}")
+            except (pickle.PicklingError, TypeError) as e:
+                 logger.error(f"Failed to serialize Risc0 receipt: {e}", exc_info=True)
+                 raise Risc0Error(f"Failed to serialize receipt: {e}") # Propagate error
+
+        else:
+            logger.error(f"Unknown attestation type in result: {attestation_type}")
+            return None
 
         # 5. Create Metadata Dictionary
         metadata = {
-            "bundle_version": "1.0-mvp",
+            "bundle_version": "1.1-risc0", # Updated version
             "timestamp_utc": timestamp,
             "prover_did": prover_did,
+            "attestation_type": attestation_type,
+            "attestation_reference": attestation_reference,
+            "risc0_image_id": risc0_image_id, # Will be None for mock
+            "mock_payload_hash": mock_payload_hash, # Will be None for risc0
             "model_hash": model_hash,
             "constraint_file": os.path.basename(constraint_file_path),
             "constraint_hash": constraint_hash,
             "prompt_hash": prompt_hash,
             "output_hash": output_hash, # May be None
-            "attestation_reference": "mock_proof.json",
-            "attestation_payload_hash": attestation_payload_hash,
-            # Add other useful info: model name, inference params?
         }
 
         # 6. Create meta.json
         meta_path = os.path.join(bundle_path, "meta.json")
         with open(meta_path, 'w') as f:
             # Use sort_keys for deterministic output before signing
-            json.dump(metadata, f, indent=2, sort_keys=True)
+            # Filter out None values for cleaner output
+            filtered_metadata = {k: v for k, v in metadata.items() if v is not None}
+            json.dump(filtered_metadata, f, indent=2, sort_keys=True)
         logger.info(f"Created metadata file: {meta_path}")
 
         # 7. Sign meta.json -> meta.sig
         with open(meta_path, 'rb') as f:
             meta_bytes = f.read()
-        # Hash the canonical meta.json bytes before signing
-        # Note: Signing the hash is more common with RSA/ECDSA.
-        # Ed25519 typically signs the message directly. We sign the raw meta.json bytes.
         meta_signature = private_key.sign(meta_bytes)
         meta_sig_path = os.path.join(bundle_path, "meta.sig")
         with open(meta_sig_path, 'wb') as f:
@@ -175,9 +202,11 @@ if __name__ == '__main__':
                 constraint_hash=mock_constraint_hash,
                 prompt=mock_prompt,
                 output_text=mock_output,
-                attestation_payload=att_payload_str,
-                attestation_payload_hash=att_payload_hash,
-                attestation_signature=att_sig,
+                attestation_result={
+                    "type": "mock",
+                    "payload_hash": att_payload_hash,
+                    "proof_data": att_sig
+                },
                 private_key_path=priv_key_path,
                 include_output_file=True
             )
