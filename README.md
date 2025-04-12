@@ -1,4 +1,4 @@
-# 🪶 Seel Project
+# 🪶 Seel
 
 This repository contains the Minimal Viable Prototype (MVP) for Seel, a system for Zero-Knowledge AI Inference Certification.
 

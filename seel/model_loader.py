@@ -1,5 +1,7 @@
 import os
-from transformers import AutoModelForCausalLM, AutoTokenizer, HfFolder
+from transformers import AutoModelForCausalLM, AutoTokenizer
+# HfFolder was moved to huggingface_hub
+from huggingface_hub.constants import HF_HUB_CACHE 
 from seel.utils import hash_directory
 import logging
 
@@ -27,8 +29,9 @@ def load_model_and_tokenizer(model_name_or_path: str) -> tuple:
         else:
             # If not a local path, treat as model ID and download/cache
             logger.info(f"Model not found locally. Attempting download/cache for: {model_name_or_path}")
-            # Use HfFolder to get the cache directory
-            cache_dir = HfFolder.get_cache_home()
+            # Use huggingface_hub constant for the cache directory
+            cache_dir = HF_HUB_CACHE
+            logger.info(f"Default Hugging Face cache directory: {cache_dir}")
             # This is a bit heuristic; models usually end up in snapshots/ dir
             # We rely on the fact that loading the model below will ensure it's cached.
             # A more robust approach might involve snapshot_download first.
@@ -48,7 +51,8 @@ def load_model_and_tokenizer(model_name_or_path: str) -> tuple:
              # We need a better way to find the actual cached model dir.
              # For now, we'll try a common pattern. This is NOT robust.
              # A better way: use huggingface_hub.snapshot_download explicitly first.
-             possible_cache_path = os.path.join(HfFolder.get_cache_home(), f"models--{model_name_or_path.replace('/', '--')}", "snapshots")
+             # Using HF_HUB_CACHE here
+             possible_cache_path = os.path.join(HF_HUB_CACHE, f"models--{model_name_or_path.replace('/', '--')}", "snapshots")
              if os.path.isdir(possible_cache_path):
                  # Assume the latest snapshot dir is the one
                  snapshots = sorted([d for d in os.listdir(possible_cache_path) if os.path.isdir(os.path.join(possible_cache_path, d))], reverse=True)
